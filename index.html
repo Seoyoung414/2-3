@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>1003 TIME-DELAY WEBCAMS</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 100vw;
+      height: 100vh;
+      background-color: #0000FF; /* Pure Blue */
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    #webcam {
+      display: none;
+    }
+
+    /* 1,003개의 웹캠이 그려질 단 하나의 메인 캔버스 */
+    #mainCanvas {
+      width: 100vw;
+      height: 100vh;
+      object-fit: contain;
+      transform: scaleX(-1); /* 거울 모드 (전체 좌우 반전) */
+    }
+  </style>
+</head>
+<body>
+
+  <video id="webcam" autoplay playsinline></video>
+  <canvas id="mainCanvas"></canvas>
+
+  <!-- MediaPipe Image Segmenter CDN -->
+  <script type="module">
+    import { ImageSegmenter, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+
+    const video = document.getElementById('webcam');
+    const mainCanvas = document.getElementById('mainCanvas');
+    const mainCtx = mainCanvas.getContext('2d');
+
+    let imageSegmenter;
+    const TOTAL_CAMS = 1003;
+
+    // 1003개를 배치하기 위한 그리드 열(Col)과 행(Row) 계산 (38 x 27 = 1026 셀)
+    const COLS = 38;
+    const ROWS = Math.ceil(TOTAL_CAMS / COLS); // 27행
+
+    // ==========================================
+    // [시간차(Delay) 설정을 위한 변수]
+    // ==========================================
+    const frameHistory = []; // 과거 프레임들을 저장할 버퍼 배열
+    const MAX_HISTORY_FRAMES = 120; // 저장할 최대 프레임 수 (약 2~4초 분량)
+
+    async function createSegmenter() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+      );
+      
+      imageSegmenter = await ImageSegmenter.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        outputCategoryMask: true
+      });
+
+      startWebcam();
+    }
+
+    async function startWebcam() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480 }
+        });
+        video.srcObject = stream;
+        video.addEventListener("loadeddata", () => {
+          initCanvasSize();
+          predictWebcam();
+        });
+      } catch (err) {
+        console.error("웹캠 접근 실패:", err);
+      }
+    }
+
+    function initCanvasSize() {
+      mainCanvas.width = window.innerWidth;
+      mainCanvas.height = window.innerHeight;
+    }
+
+    let lastVideoTime = -1;
+    async function predictWebcam() {
+      if (video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+
+        imageSegmenter.segmentForVideo(video, performance.now(), (result) => {
+          processAndRenderTimeDelay(result.categoryMask);
+        });
+      }
+
+      requestAnimationFrame(predictWebcam);
+    }
+
+    // 시차(Time-Delay) 합성 및 렌더링 함수
+    function processAndRenderTimeDelay(categoryMask) {
+      const width = video.videoWidth || 640;
+      const height = video.videoHeight || 480;
+
+      // 1. 현재 프레임을 그릴 새로운 메모리용 Canvas 생성
+      const currentCanvas = document.createElement('canvas');
+      currentCanvas.width = width;
+      currentCanvas.height = height;
+      const currentCtx = currentCanvas.getContext('2d');
+
+      // 비디오 프레임 추출 및 배경 처리
+      currentCtx.drawImage(video, 0, 0, width, height);
+      const frame = currentCtx.getImageData(0, 0, width, height);
+      const data = frame.data;
+      const mask = categoryMask.getAsUint8Array();
+
+      // 인물 외 배경 흰색(#FFFFFF) 처리
+      for (let i = 0; i < mask.length; i++) {
+        if (mask[i] === 0) { 
+          const pixelIndex = i * 4;
+          data[pixelIndex] = 255;     // R
+          data[pixelIndex + 1] = 255; // G
+          data[pixelIndex + 2] = 255; // B
+        }
+      }
+      currentCtx.putImageData(frame, 0, 0);
+
+      // 2. 버퍼 배열(frameHistory)의 맨 앞에 저장 (최신 프레임)
+      frameHistory.unshift(currentCanvas);
+
+      // 버퍼가 최대 길이를 넘어서면 가장 오래된 과거 프레임 삭제
+      if (frameHistory.length > MAX_HISTORY_FRAMES) {
+        frameHistory.pop();
+      }
+
+      // 3. 메인 캔버스 렌더링
+      const canvasWidth = mainCanvas.width;
+      const canvasHeight = mainCanvas.height;
+
+      mainCtx.fillStyle = "#0000FF";
+      mainCtx.fillRect(0, 0, canvasWidth, canvasHeight);
+
+      const cellWidth = canvasWidth / COLS;
+      const cellHeight = canvasHeight / ROWS;
+
+      // 4. 1003개의 각 위치(count)마다 서로 다른 시간차(Delay) 적용하여 그리기
+      let count = 0;
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+          if (count >= TOTAL_CAMS) break;
+
+          // 인덱스(count)에 비례하여 과거 프레임 계산
+          // 0번째(첫 번째 타일) = 가장 최신 프레임 (frameHistory[0])
+          // 1002번째(마지막 타일) = 가장 오래된 과거 프레임
+          const delayProgress = count / TOTAL_CAMS; 
+          const historyIndex = Math.floor(delayProgress * (frameHistory.length - 1));
+
+          // 해당 시간차의 과거 프레임 캔버스 가져오기
+          const targetCanvas = frameHistory[historyIndex] || currentCanvas;
+
+          const x = c * cellWidth;
+          const y = r * cellHeight;
+
+          mainCtx.drawImage(
+            targetCanvas, 
+            0, 0, width, height,
+            x, y, cellWidth, cellHeight
+          );
+
+          count++;
+        }
+      }
+    }
+
+    window.addEventListener('resize', () => {
+      mainCanvas.width = window.innerWidth;
+      mainCanvas.height = window.innerHeight;
+    });
+
+    createSegmenter();
+  </script>
+
+</body>
+</html>
